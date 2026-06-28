@@ -1,0 +1,25 @@
+*.safetensors
+logs/
+*.logs
+*.log
+.venv/
+*.pt
+*.pth
+*.mp3
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Weights & Archives
+weights/
+*.tar
+*.gz
+*.tar.gz

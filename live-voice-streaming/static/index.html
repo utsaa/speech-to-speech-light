@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live AI Voice Agent</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="glow-orb"></div>
+            <h1>AI Voice Agent</h1>
+            <p>Native Bengali Speech-to-Speech</p>
+        </header>
+
+        <main>
+            <div class="status-panel">
+                <div class="status-indicator" id="statusIndicator"></div>
+                <span id="statusText">Disconnected</span>
+            </div>
+
+            <div class="controls">
+                <button id="connectBtn" class="btn primary">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="22"></line></svg>
+                    Connect
+                </button>
+                <button id="muteBtn" class="btn secondary" disabled>
+                    <svg id="muteIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="22"></line></svg>
+                    <span>Mute</span>
+                </button>
+            </div>
+            
+            <div class="volume-container" style="margin-top: 1rem; width: 100%; max-width: 300px; display: flex; flex-direction: column; align-items: center; gap: 0.5rem;">
+                <label for="volumeSlider" style="color: var(--text-secondary); font-size: 0.9rem;">TTS Volume: <span id="volumeVal">400%</span></label>
+                <input type="range" id="volumeSlider" min="100" max="700" value="400" style="width: 100%;">
+            </div>
+
+            <div class="visualizer-container">
+                <canvas id="visualizer"></canvas>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        let ws;
+        let audioContext;
+        let micStream;
+        let scriptProcessor;
+        let isMuted = false;
+        
+        let analyser;
+        const canvas = document.getElementById('visualizer');
+        const canvasCtx = canvas.getContext('2d');
+        let drawVisual;
+        
+        const connectBtn = document.getElementById('connectBtn');
+        const muteBtn = document.getElementById('muteBtn');
+        const muteIcon = document.getElementById('muteIcon');
+        const statusText = document.getElementById('statusText');
+        const statusIndicator = document.getElementById('statusIndicator');
+        const volumeSlider = document.getElementById('volumeSlider');
+        const volumeVal = document.getElementById('volumeVal');
+        
+        let globalGainNode = null;
+
+        // Volume logic
+        volumeSlider.addEventListener('input', (e) => {
+            const val = e.target.value;
+            volumeVal.textContent = `${val}%`;
+            if (globalGainNode) {
+                globalGainNode.gain.value = val / 100.0;
+            }
+        });
+
+        // Connect/Disconnect logic
+        connectBtn.addEventListener('click', async () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                disconnect();
+            } else {
+                await connect();
+            }
+        });
+
+        // Mute/Unmute logic
+        muteBtn.addEventListener('click', () => {
+            isMuted = !isMuted;
+            const span = muteBtn.querySelector('span');
+            if (isMuted) {
+                span.textContent = 'Unmute';
+                muteBtn.classList.add('muted');
+                muteIcon.innerHTML = `<line x1="1" y1="1" x2="23" y2="23"></line><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"></path><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"></path><line x1="12" y1="19" x2="12" y2="22"></line>`;
+            } else {
+                span.textContent = 'Mute';
+                muteBtn.classList.remove('muted');
+                muteIcon.innerHTML = `<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="22"></line>`;
+            }
+        });
+
+        async function connect() {
+            try {
+                // Request mic permissions
+                micStream = await navigator.mediaDevices.getUserMedia({ audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                }});
+                
+                // Set up Audio Context for capturing (and later playback)
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                const source = audioContext.createMediaStreamSource(micStream);
+                
+                // Set up Analyser for visualizer
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 1024;
+                source.connect(analyser);
+                drawWaveform();
+                
+                // We use ScriptProcessorNode for easy raw Float32 PCM extraction
+                // (In a prod app, AudioWorklet is preferred, but this works universally without an extra file)
+                scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                // Set up WebSocket
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(`${protocol}//${window.location.host}/ws/stream`);
+                ws.binaryType = 'arraybuffer';
+                
+                ws.onopen = () => {
+                    statusText.textContent = 'Connected & Listening';
+                    statusIndicator.style.background = '#10b981';
+                    statusIndicator.style.boxShadow = '0 0 10px #10b981';
+                    connectBtn.innerHTML = 'Disconnect';
+                    connectBtn.classList.replace('primary', 'danger');
+                    muteBtn.disabled = false;
+                    
+                    // Start processing audio
+                    source.connect(scriptProcessor);
+                    scriptProcessor.connect(audioContext.destination);
+                };
+                
+                ws.onclose = () => {
+                    disconnect();
+                };
+                
+                // Track when TTS is speaking to prevent echo loops
+                let nextPlayTime = 0;
+
+                // Process mic audio and send to server
+                scriptProcessor.onaudioprocess = (e) => {
+                    if (ws.readyState !== WebSocket.OPEN) return;
+                    
+                    let inputData = e.inputBuffer.getChannelData(0);
+                    
+                    // If manually muted OR if the TTS is currently speaking, send pure silence
+                    const isTtsSpeaking = audioContext.currentTime < nextPlayTime;
+                    if (isMuted || isTtsSpeaking) {
+                        inputData = new Float32Array(inputData.length);
+                    }
+                    
+                    ws.send(inputData.buffer);
+                };
+                
+                // Handle incoming audio from server (TTS playback)
+                ws.onmessage = (event) => {
+                    const audioData = new Float32Array(event.data);
+                    
+                    // Ensure we don't schedule playback in the past
+                    if (nextPlayTime < audioContext.currentTime) {
+                        nextPlayTime = audioContext.currentTime;
+                    }
+                    
+                    const audioBuffer = audioContext.createBuffer(1, audioData.length, 24000); // 24kHz from F5-TTS
+                    audioBuffer.copyToChannel(audioData, 0);
+                    
+                    const sourceNode = audioContext.createBufferSource();
+                    sourceNode.buffer = audioBuffer;
+                    
+                    // Connect TTS output to a Gain Node to artificially boost volume on the client side
+                    if (!globalGainNode) {
+                        globalGainNode = audioContext.createGain();
+                        globalGainNode.gain.value = volumeSlider.value / 100.0;
+                    }
+                    
+                    sourceNode.connect(globalGainNode);
+                    globalGainNode.connect(audioContext.destination);
+                    
+                    // Also connect to visualizer
+                    sourceNode.connect(analyser);
+                    
+                    sourceNode.start(nextPlayTime);
+                    
+                    nextPlayTime += audioBuffer.duration;
+                };
+                
+            } catch (err) {
+                console.error('Error connecting:', err);
+                alert('Could not access microphone or connect to server.');
+                disconnect();
+            }
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            if (micStream) {
+                micStream.getTracks().forEach(track => track.stop());
+                micStream = null;
+            }
+            if (scriptProcessor) {
+                scriptProcessor.disconnect();
+                scriptProcessor = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            
+            statusText.textContent = 'Disconnected';
+            statusIndicator.style.background = '#ef4444';
+            statusIndicator.style.boxShadow = 'none';
+            connectBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="22"></line></svg> Connect`;
+            connectBtn.classList.replace('danger', 'primary');
+            muteBtn.disabled = true;
+            isMuted = false;
+            muteBtn.querySelector('span').textContent = 'Mute';
+            muteBtn.classList.remove('muted');
+            
+            if (drawVisual) {
+                cancelAnimationFrame(drawVisual);
+            }
+            canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+
+        function drawWaveform() {
+            // Setup canvas dimensions to match container
+            const container = canvas.parentElement;
+            canvas.width = container.offsetWidth;
+            canvas.height = container.offsetHeight;
+
+            drawVisual = requestAnimationFrame(drawWaveform);
+
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteTimeDomainData(dataArray);
+
+            canvasCtx.fillStyle = 'transparent';
+            canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
+
+            canvasCtx.lineWidth = 2;
+            canvasCtx.strokeStyle = '#3b82f6'; // using the accent color
+
+            canvasCtx.beginPath();
+            
+            const sliceWidth = canvas.width * 1.0 / bufferLength;
+            let x = 0;
+            
+            // Calculate RMS to determine if we should show the wave
+            let rms = 0;
+            for (let i = 0; i < bufferLength; i++) {
+                let v = (dataArray[i] - 128) / 128.0;
+                rms += v * v;
+            }
+            rms = Math.sqrt(rms / bufferLength);
+
+            // If muted or below a tiny threshold, draw a flat line
+            const vadThreshold = parseFloat("{{VAD_THRESHOLD}}") || 0.015;
+            if (isMuted || rms < vadThreshold) {
+                canvasCtx.moveTo(0, canvas.height / 2);
+                canvasCtx.lineTo(canvas.width, canvas.height / 2);
+            } else {
+                for (let i = 0; i < bufferLength; i++) {
+                    const v = dataArray[i] / 128.0;
+                    const y = v * (canvas.height / 2);
+
+                    if (i === 0) {
+                        canvasCtx.moveTo(x, y);
+                    } else {
+                        canvasCtx.lineTo(x, y);
+                    }
+                    x += sliceWidth;
+                }
+            }
+
+            canvasCtx.lineTo(canvas.width, canvas.height / 2);
+            canvasCtx.stroke();
+        }
+    </script>
+</body>
+</html>
